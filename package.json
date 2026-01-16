@@ -1,0 +1,6 @@
+{
+  "name": "pigallery2-random-info-extension",
+  "version": "0.1.0",
+  "description": "Adds an /info endpoint to the existing RANDOM API that returns only media metadata (supports count and exclude; configurable to include videos).",
+  "license": "MIT"
+}
