@@ -27,12 +27,17 @@
     
     /* Actions Bar */
     .toolbar { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; align-items: center; justify-content: space-between; }
+    .toolbar-left { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
     .group-filters { display: flex; flex-wrap: wrap; gap: 8px; }
     .filter-btn { background: #1e293b; border: 1px solid var(--border); color: #cbd5e1; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; transition: all 0.15s; }
     .filter-btn.active { background: var(--primary); border-color: var(--primary); color: #fff; }
     .filter-btn:hover { opacity: 0.9; }
 
-    .btn { background: var(--primary); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; font-size: 14px; cursor: pointer; transition: background 0.15s; display: inline-flex; align-items: center; gap: 6px; }
+    .active-toggle-label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #cbd5e1; cursor: pointer; background: #1e293b; border: 1px solid var(--border); padding: 5px 10px; border-radius: 6px; user-select: none; }
+    .active-toggle-label:hover { border-color: #475569; }
+    .active-toggle-label input { accent-color: var(--primary); cursor: pointer; }
+
+    .btn { background: var(--primary); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; font-size: 14px; cursor: pointer; transition: background 0.15s; display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
     .btn:hover { background: var(--primary-hover); }
     .btn-danger { background: var(--danger); }
     .btn-danger:hover { background: var(--danger-hover); }
@@ -107,8 +112,14 @@
   </header>
 
   <div class="toolbar">
-    <div class="group-filters" id="group-filters">
-      <button class="filter-btn active" onclick="setFilter('all')">すべて</button>
+    <div class="toolbar-left">
+      <div class="group-filters" id="group-filters">
+        <button class="filter-btn active" onclick="setFilter('all')">すべて</button>
+      </div>
+      <label class="active-toggle-label">
+        <input type="checkbox" id="filter-active-only" onchange="toggleActiveOnly(this.checked)">
+        <span>Active のみ表示</span>
+      </label>
     </div>
     <div style="display:flex; gap:8px;">
       <button class="btn btn-secondary btn-sm" onclick="toggleCurrentGroup(true)">このグループを全有効</button>
@@ -185,6 +196,7 @@
 <script>
   let allPresets = [];
   let currentFilter = 'all';
+  let activeOnly = false;
   // Cache fetched sample thumbnail URLs per preset id so switching filters doesn't refetch
   const thumbCache = new Map();
 
@@ -234,16 +246,25 @@
     render();
   }
 
+  function toggleActiveOnly(checked) {
+    activeOnly = checked;
+    render();
+  }
+
   function renderPresets() {
     const container = document.getElementById('presets-container');
     container.innerHTML = '';
 
-    const filtered = currentFilter === 'all'
+    let filtered = currentFilter === 'all'
       ? allPresets
       : allPresets.filter(p => (p.group || '') === currentFilter);
 
+    if (activeOnly) {
+      filtered = filtered.filter(p => p.active !== false);
+    }
+
     if (filtered.length === 0) {
-      container.innerHTML = '<div style="color:var(--text-muted); padding:30px; grid-column:1/-1; text-align:center;">プリセットがありません</div>';
+      container.innerHTML = '<div style="color:var(--text-muted); padding:30px; grid-column:1/-1; text-align:center;">条件に一致するプリセットがありません</div>';
       return;
     }
 
@@ -253,6 +274,7 @@
       card.id = `preset-card-${preset.id}`;
 
       const queryStr = JSON.stringify(preset.searchQuery || {});
+      const galleryUrl = `/search/${encodeURIComponent(queryStr)}`;
 
       card.innerHTML = `
         <div class="card-thumb-container" onclick="testPreview(${preset.id})">
@@ -273,7 +295,10 @@
             <div class="query-summary" title="${escapeHtml(queryStr)}">${escapeHtml(queryStr)}</div>
           </div>
           <div class="preset-footer">
-            <button class="btn btn-secondary btn-sm" onclick="testPreview(${preset.id})">🔍 拡大</button>
+            <div style="display:flex; gap:6px;">
+              <button class="btn btn-secondary btn-sm" onclick="testPreview(${preset.id})">🔍 拡大</button>
+              <a href="${galleryUrl}" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-sm" title="PiGallery2 で検索結果一覧を開く">🔗 ギャラリー</a>
+            </div>
             <div class="preset-actions">
               <button class="btn btn-secondary btn-sm" onclick="openEditModal(${preset.id})">編集</button>
               <button class="btn btn-danger btn-sm" onclick="deletePreset(${preset.id})">削除</button>
