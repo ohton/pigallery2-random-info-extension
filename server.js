@@ -12,8 +12,9 @@ module.exports.init = async (extension) => {
   const Message = require('/app/src/common/entities/Message').Message;
   const { ErrorDTO, ErrorCodes } = require('/app/src/common/entities/Error');
 
-  // Path to presets file
+  // Path to presets file and UI HTML
   const presetsPath = path.resolve('/app/data/config/shuffle_presets.json');
+  const uiHtmlPath = path.resolve(__dirname, 'index.html');
 
   function loadPresets() {
     try {
@@ -107,7 +108,19 @@ module.exports.init = async (extension) => {
     return fullEntries;
   }
 
-  // 1. GET /gallery/random/shuffle/info - Pick a random active preset and return media info
+  // 1. GET /gallery/random/presets/ui - Serve Management Web UI
+  app.get(
+    Config.Server.apiPath + '/gallery/random/presets/ui',
+    (req, res) => {
+      if (fs.existsSync(uiHtmlPath)) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.sendFile(uiHtmlPath);
+      }
+      return res.status(404).send('UI template not found');
+    }
+  );
+
+  // 2. GET /gallery/random/shuffle/info - Pick a random active preset and return media info
   app.get(
     Config.Server.apiPath + '/gallery/random/shuffle/info',
     AuthenticationMWs.authenticate,
@@ -145,7 +158,6 @@ module.exports.init = async (extension) => {
           return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'No media found for preset: ' + selectedPreset.name), null));
         }
 
-        // Attach preset metadata for client debugging/display
         if (Array.isArray(mediaResult)) {
           return res.json(new Message(null, {
             preset: { id: selectedPreset.id, name: selectedPreset.name, group: selectedPreset.group },
@@ -153,7 +165,6 @@ module.exports.init = async (extension) => {
           }));
         }
 
-        // For single media, preserve top-level media fields (for backwards compatibility) and attach preset
         const responseData = Object.assign({}, mediaResult, {
           preset: { id: selectedPreset.id, name: selectedPreset.name, group: selectedPreset.group },
         });
@@ -165,7 +176,7 @@ module.exports.init = async (extension) => {
     }
   );
 
-  // 2. GET /gallery/random/shuffle - Redirect or serve random photo directly from active presets
+  // 3. GET /gallery/random/shuffle - Redirect or serve random photo directly from active presets
   app.get(
     Config.Server.apiPath + '/gallery/random/shuffle',
     AuthenticationMWs.authenticate,
@@ -188,7 +199,6 @@ module.exports.init = async (extension) => {
         const queryStr = encodeURIComponent(JSON.stringify(selectedPreset.searchQuery || { type: 100, text: '' }));
         const randomParam = Math.random().toString(32).substring(2);
 
-        // Redirect to PiGallery2's native random image endpoint
         return res.redirect(`${Config.Server.apiPath}/gallery/random/${queryStr}?${randomParam}`);
       } catch (e) {
         return next(new ErrorDTO(ErrorCodes.GENERAL_ERROR, "Can't redirect shuffle random photo: " + e.toString(), e));
@@ -196,7 +206,7 @@ module.exports.init = async (extension) => {
     }
   );
 
-  // 3. GET /gallery/random/presets - List all presets
+  // 4. GET /gallery/random/presets - List all presets
   app.get(
     Config.Server.apiPath + '/gallery/random/presets',
     AuthenticationMWs.authenticate,
@@ -207,7 +217,92 @@ module.exports.init = async (extension) => {
     }
   );
 
-  // 4. POST /gallery/random/presets/toggle - Toggle preset active status
+  // 5. POST /gallery/random/presets - Create new preset
+  app.post(
+    Config.Server.apiPath + '/gallery/random/presets',
+    AuthenticationMWs.authenticate,
+    AuthenticationMWs.authorise(UserRoles.User),
+    async (req, res, next) => {
+      try {
+        const { name, group, searchQuery, active } = req.body || {};
+        if (!name) {
+          return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'Missing preset name'), null));
+        }
+
+        const presets = loadPresets();
+        const maxId = presets.reduce((max, p) => (p.id > max ? p.id : max), 0);
+        const newPreset = {
+          id: maxId + 1,
+          name: String(name).trim(),
+          group: group ? String(group).trim() : '',
+          active: active !== undefined ? !!active : true,
+          searchQuery: searchQuery || { type: 100, text: '' },
+        };
+
+        presets.push(newPreset);
+        savePresets(presets);
+
+        return res.json(new Message(null, newPreset));
+      } catch (e) {
+        return next(new ErrorDTO(ErrorCodes.GENERAL_ERROR, 'Failed to create preset: ' + e.toString(), e));
+      }
+    }
+  );
+
+  // 6. PUT /gallery/random/presets/:id - Update existing preset
+  app.put(
+    Config.Server.apiPath + '/gallery/random/presets/:id',
+    AuthenticationMWs.authenticate,
+    AuthenticationMWs.authorise(UserRoles.User),
+    async (req, res, next) => {
+      try {
+        const id = parseInt(req.params.id, 10);
+        const { name, group, searchQuery, active } = req.body || {};
+
+        const presets = loadPresets();
+        const target = presets.find((p) => p.id === id);
+        if (!target) {
+          return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'Preset not found'), null));
+        }
+
+        if (name !== undefined) target.name = String(name).trim();
+        if (group !== undefined) target.group = String(group).trim();
+        if (searchQuery !== undefined) target.searchQuery = searchQuery;
+        if (active !== undefined) target.active = !!active;
+
+        savePresets(presets);
+        return res.json(new Message(null, target));
+      } catch (e) {
+        return next(new ErrorDTO(ErrorCodes.GENERAL_ERROR, 'Failed to update preset: ' + e.toString(), e));
+      }
+    }
+  );
+
+  // 7. DELETE /gallery/random/presets/:id - Delete preset
+  app.delete(
+    Config.Server.apiPath + '/gallery/random/presets/:id',
+    AuthenticationMWs.authenticate,
+    AuthenticationMWs.authorise(UserRoles.User),
+    async (req, res, next) => {
+      try {
+        const id = parseInt(req.params.id, 10);
+        let presets = loadPresets();
+        const initialLen = presets.length;
+        presets = presets.filter((p) => p.id !== id);
+
+        if (presets.length === initialLen) {
+          return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'Preset not found'), null));
+        }
+
+        savePresets(presets);
+        return res.json(new Message(null, { id, deleted: true }));
+      } catch (e) {
+        return next(new ErrorDTO(ErrorCodes.GENERAL_ERROR, 'Failed to delete preset: ' + e.toString(), e));
+      }
+    }
+  );
+
+  // 8. POST /gallery/random/presets/toggle - Toggle preset active status
   app.post(
     Config.Server.apiPath + '/gallery/random/presets/toggle',
     AuthenticationMWs.authenticate,
@@ -235,7 +330,7 @@ module.exports.init = async (extension) => {
     }
   );
 
-  // 5. Existing: GET /gallery/random/:searchQueryDTO/info
+  // 9. Existing: GET /gallery/random/:searchQueryDTO/info
   app.get(
     Config.Server.apiPath + '/gallery/random/:searchQueryDTO/info',
     AuthenticationMWs.authenticate,
