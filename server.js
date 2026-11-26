@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 
 module.exports.init = async (extension) => {
   const app = extension._app.expressApp;
@@ -9,11 +10,232 @@ module.exports.init = async (extension) => {
   const UserRoles = require('/app/src/common/entities/UserDTO').UserRoles;
   const SortByTypes = require('/app/src/common/entities/SortingMethods').SortByTypes;
   const Message = require('/app/src/common/entities/Message').Message;
-  const {ErrorDTO, ErrorCodes} = require('/app/src/common/entities/Error');
+  const { ErrorDTO, ErrorCodes } = require('/app/src/common/entities/Error');
 
-  
+  // Path to presets file
+  const presetsPath = path.resolve('/app/data/config/shuffle_presets.json');
 
-  // Register route to return only media info for a random media item matching the search query
+  function loadPresets() {
+    try {
+      if (fs.existsSync(presetsPath)) {
+        const raw = fs.readFileSync(presetsPath, 'utf8');
+        return JSON.parse(raw);
+      }
+    } catch (e) {
+      console.error('[random-info] Failed to load shuffle_presets.json:', e);
+    }
+    return [];
+  }
+
+  function savePresets(presets) {
+    try {
+      fs.writeFileSync(presetsPath, JSON.stringify(presets, null, 2), 'utf8');
+      return true;
+    } catch (e) {
+      console.error('[random-info] Failed to save shuffle_presets.json:', e);
+      return false;
+    }
+  }
+
+  // Helper to execute media search and entry retrieval
+  async function fetchRandomMedia(context, query, count, excludeIdsStr, allowVideosReq) {
+    const safeCount = Math.min(Math.max(1, parseInt(count || 1, 10) || 1), 100);
+
+    const excludeIds = new Set();
+    if (excludeIdsStr) {
+      excludeIdsStr.split(',').forEach((id) => {
+        const numId = parseInt(id.trim(), 10);
+        if (!isNaN(numId)) {
+          excludeIds.add(numId);
+        }
+      });
+    }
+
+    const fetchCount = excludeIds.size > 0
+      ? Math.min(safeCount * 3 + excludeIds.size, 200)
+      : safeCount;
+    const photoOnly = !allowVideosReq;
+
+    let media = await obj.SearchManager.getNMedia(
+      context,
+      query,
+      [{ method: SortByTypes.Random, ascending: null }],
+      fetchCount,
+      photoOnly
+    );
+
+    if (excludeIds.size > 0) {
+      media = media.filter((m) => !excludeIds.has(m.id));
+    }
+
+    media = media.slice(0, safeCount);
+    if (!media || media.length === 0) {
+      return safeCount === 1 ? null : [];
+    }
+
+    if (safeCount === 1) {
+      const item = media[0];
+      const mediaPath = path.join(item.directory.path, item.directory.name, item.name);
+      const mediaEntry = await obj.GalleryManager.getMedia(context, mediaPath);
+      return {
+        id: mediaEntry.id,
+        name: mediaEntry.name,
+        metadata: mediaEntry.metadata,
+        directory: {
+          id: mediaEntry.directory.id,
+          name: mediaEntry.directory.name,
+          path: mediaEntry.directory.path,
+        },
+      };
+    }
+
+    const fullEntries = [];
+    for (const item of media) {
+      const mediaPath = path.join(item.directory.path, item.directory.name, item.name);
+      const mediaEntry = await obj.GalleryManager.getMedia(context, mediaPath);
+      fullEntries.push({
+        id: mediaEntry.id,
+        name: mediaEntry.name,
+        metadata: mediaEntry.metadata,
+        directory: {
+          id: mediaEntry.directory.id,
+          name: mediaEntry.directory.name,
+          path: mediaEntry.directory.path,
+        },
+      });
+    }
+    return fullEntries;
+  }
+
+  // 1. GET /gallery/random/shuffle/info - Pick a random active preset and return media info
+  app.get(
+    Config.Server.apiPath + '/gallery/random/shuffle/info',
+    AuthenticationMWs.authenticate,
+    AuthenticationMWs.authorise(UserRoles.LimitedGuest),
+    async (req, res, next) => {
+      try {
+        const presets = loadPresets();
+        const groupFilter = req.query['group'];
+        let activePresets = presets.filter((p) => p.active !== false);
+
+        if (groupFilter) {
+          activePresets = activePresets.filter((p) => p.group === groupFilter);
+        }
+
+        if (activePresets.length === 0) {
+          return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'No active presets available'), null));
+        }
+
+        // Pick one preset at random
+        const selectedPreset = activePresets[Math.floor(Math.random() * activePresets.length)];
+        const query = selectedPreset.searchQuery || { type: 100, text: '' };
+
+        const extCfgReq = extension.config.getConfig() || {};
+        const allowVideosReq = !!extCfgReq.allowVideos;
+
+        const mediaResult = await fetchRandomMedia(
+          req.session.context,
+          query,
+          req.query['count'],
+          req.query['exclude'],
+          allowVideosReq
+        );
+
+        if (!mediaResult || (Array.isArray(mediaResult) && mediaResult.length === 0)) {
+          return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'No media found for preset: ' + selectedPreset.name), null));
+        }
+
+        // Attach preset metadata for client debugging/display
+        if (Array.isArray(mediaResult)) {
+          return res.json(new Message(null, {
+            preset: { id: selectedPreset.id, name: selectedPreset.name, group: selectedPreset.group },
+            media: mediaResult,
+          }));
+        }
+
+        // For single media, preserve top-level media fields (for backwards compatibility) and attach preset
+        const responseData = Object.assign({}, mediaResult, {
+          preset: { id: selectedPreset.id, name: selectedPreset.name, group: selectedPreset.group },
+        });
+
+        return res.json(new Message(null, responseData));
+      } catch (e) {
+        return next(new ErrorDTO(ErrorCodes.GENERAL_ERROR, "Can't get shuffle random photo info: " + e.toString(), e));
+      }
+    }
+  );
+
+  // 2. GET /gallery/random/shuffle - Redirect or serve random photo directly from active presets
+  app.get(
+    Config.Server.apiPath + '/gallery/random/shuffle',
+    AuthenticationMWs.authenticate,
+    AuthenticationMWs.authorise(UserRoles.LimitedGuest),
+    async (req, res, next) => {
+      try {
+        const presets = loadPresets();
+        const groupFilter = req.query['group'];
+        let activePresets = presets.filter((p) => p.active !== false);
+
+        if (groupFilter) {
+          activePresets = activePresets.filter((p) => p.group === groupFilter);
+        }
+
+        if (activePresets.length === 0) {
+          return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'No active presets available'), null));
+        }
+
+        const selectedPreset = activePresets[Math.floor(Math.random() * activePresets.length)];
+        const queryStr = encodeURIComponent(JSON.stringify(selectedPreset.searchQuery || { type: 100, text: '' }));
+        const randomParam = Math.random().toString(32).substring(2);
+
+        // Redirect to PiGallery2's native random image endpoint
+        return res.redirect(`${Config.Server.apiPath}/gallery/random/${queryStr}?${randomParam}`);
+      } catch (e) {
+        return next(new ErrorDTO(ErrorCodes.GENERAL_ERROR, "Can't redirect shuffle random photo: " + e.toString(), e));
+      }
+    }
+  );
+
+  // 3. GET /gallery/random/presets - List all presets
+  app.get(
+    Config.Server.apiPath + '/gallery/random/presets',
+    AuthenticationMWs.authenticate,
+    AuthenticationMWs.authorise(UserRoles.LimitedGuest),
+    async (req, res) => {
+      const presets = loadPresets();
+      return res.json(new Message(null, presets));
+    }
+  );
+
+  // 4. POST /gallery/random/presets/toggle - Toggle preset active status
+  app.post(
+    Config.Server.apiPath + '/gallery/random/presets/toggle',
+    AuthenticationMWs.authenticate,
+    AuthenticationMWs.authorise(UserRoles.User),
+    async (req, res, next) => {
+      try {
+        const { id, active } = req.body || {};
+        if (id === undefined) {
+          return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'Missing preset id'), null));
+        }
+
+        const presets = loadPresets();
+        const target = presets.find((p) => p.id === id);
+        if (!target) {
+          return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'Preset not found'), null));
+        }
+
+        target.active = active !== undefined ? !!active : !target.active;
+        savePresets(presets);
+
+        return res.json(new Message(null, { id: target.id, name: target.name, active: target.active }));
+      } catch (e) {
+        return next(new ErrorDTO(ErrorCodes.GENERAL_ERROR, 'Failed to toggle preset: ' + e.toString(), e));
+      }
+    }
+  );
+
+  // 5. Existing: GET /gallery/random/:searchQueryDTO/info
   app.get(
     Config.Server.apiPath + '/gallery/random/:searchQueryDTO/info',
     AuthenticationMWs.authenticate,
@@ -29,88 +251,22 @@ module.exports.init = async (extension) => {
           }
         }
 
-        // Support count and exclude parameters (mirror GalleryMWs.getRandomMediaInfo)
-        const count = Math.min(
-          Math.max(1, parseInt(req.query['count'] || 1, 10) || 1),
-          100
-        );
-
-        const excludeIdsStr = req.query['exclude'];
-        const excludeIds = new Set();
-        if (excludeIdsStr) {
-          excludeIdsStr.split(',').forEach(id => {
-            const numId = parseInt(id.trim(), 10);
-            if (!isNaN(numId)) {
-              excludeIds.add(numId);
-            }
-          });
-        }
-
-        const fetchCount = excludeIds.size > 0
-          ? Math.min(count * 3 + excludeIds.size, 200)
-          : count;
-
-        // Read extension config at request-time so runtime changes take effect
         const extCfgReq = extension.config.getConfig() || {};
         const allowVideosReq = !!extCfgReq.allowVideos;
-        const photoOnly = !allowVideosReq;
 
-        let media = await obj.SearchManager.getNMedia(
+        const result = await fetchRandomMedia(
           req.session.context,
           query,
-          [{method: SortByTypes.Random, ascending: null}],
-          fetchCount,
-          photoOnly
+          req.query['count'],
+          req.query['exclude'],
+          allowVideosReq
         );
 
-        
-
-        if (excludeIds.size > 0) {
-          media = media.filter(m => !excludeIds.has(m.id));
-        }
-
-        media = media.slice(0, count);
-
-        if (!media || media.length === 0) {
+        if (!result || (Array.isArray(result) && result.length === 0)) {
           return res.json(new Message(new ErrorDTO(ErrorCodes.INPUT_ERROR, 'No media found'), null));
         }
 
-        // If single, return object; else return array
-        if (count === 1) {
-          const item = media[0];
-          const mediaPath = path.join(item.directory.path, item.directory.name, item.name);
-          const mediaEntry = await obj.GalleryManager.getMedia(req.session.context, mediaPath);
-          const result = {
-            id: mediaEntry.id,
-            name: mediaEntry.name,
-            metadata: mediaEntry.metadata,
-            directory: {
-              id: mediaEntry.directory.id,
-              name: mediaEntry.directory.name,
-              path: mediaEntry.directory.path
-            }
-          };
-          return res.json(new Message(null, result));
-        }
-
-        // map to full media entries for multi-result
-        const fullEntries = [];
-        for (const item of media) {
-          const mediaPath = path.join(item.directory.path, item.directory.name, item.name);
-          const mediaEntry = await obj.GalleryManager.getMedia(req.session.context, mediaPath);
-          const entry = {
-            id: mediaEntry.id,
-            name: mediaEntry.name,
-            metadata: mediaEntry.metadata,
-            directory: {
-              id: mediaEntry.directory.id,
-              name: mediaEntry.directory.name,
-              path: mediaEntry.directory.path
-            }
-          };
-          fullEntries.push(entry);
-        }
-        return res.json(new Message(null, fullEntries));
+        return res.json(new Message(null, result));
       } catch (e) {
         return next(new ErrorDTO(ErrorCodes.GENERAL_ERROR, "Can't get random photo: " + e.toString(), e));
       }
@@ -119,5 +275,5 @@ module.exports.init = async (extension) => {
 };
 
 module.exports.cleanUp = async (extension) => {
-  // no cleanup necessary for this simple extension
+  // no cleanup necessary
 };
